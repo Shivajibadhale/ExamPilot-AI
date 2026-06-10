@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -15,12 +16,27 @@ from src.agents import (
 )
 from src.document_processor import DocumentProcessor
 from src.llm_provider import build_chat_model, build_embedding_model
+from src.reasoning_orchestrator import AgentRunResult, run_demo_detailed
 from src.ui import agent_card, inject_custom_css, render_chat_message
 
 
 APP_TITLE = "AI Engineering Exam Copilot"
 
 load_dotenv()
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def secret_or_env(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, os.getenv(name, default)))
+    except Exception:
+        return os.getenv(name, default)
 
 
 def init_state() -> None:
@@ -36,6 +52,7 @@ def init_state() -> None:
         "quiz_submitted": False,
         "last_viva": None,
         "last_plan": None,
+        "last_reasoning_demo": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -43,8 +60,8 @@ def init_state() -> None:
 
 def api_key_for(provider: str) -> str:
     if provider == "Gemini":
-        return st.session_state.get("gemini_api_key") or os.getenv("GOOGLE_API_KEY", "")
-    return st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY", "")
+        return st.session_state.get("gemini_api_key") or secret_or_env("GOOGLE_API_KEY")
+    return st.session_state.get("openai_api_key") or secret_or_env("OPENAI_API_KEY")
 
 
 def render_sidebar() -> tuple[str, str, float]:
@@ -58,55 +75,83 @@ def render_sidebar() -> tuple[str, str, float]:
                 "Quiz",
                 "Viva Prep",
                 "Study Planner",
+                "Reasoning Agent",
             ],
             label_visibility="collapsed",
         )
 
-        provider = os.getenv("MODEL_PROVIDER", "Gemini")
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash-lite")
+        provider = secret_or_env("MODEL_PROVIDER", "Gemini")
+        model_name = secret_or_env("MODEL_NAME", "gemini-2.5-flash-lite")
 
-        with st.expander("Developer settings"):
-            provider = st.selectbox(
-                "Model provider",
-                ["Gemini", "OpenAI"],
-                index=0 if provider == "Gemini" else 1,
-            )
+        if env_flag("SHOW_LOCAL_CONFIG"):
+            with st.expander("Local configuration"):
+                provider = st.selectbox(
+                    "Model provider",
+                    ["Gemini", "OpenAI"],
+                    index=0 if provider == "Gemini" else 1,
+                )
 
-            if provider == "Gemini":
-                model_name = st.selectbox(
-                    "Gemini model",
-                    ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"],
-                    index=["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"].index(model_name)
-                    if model_name in ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]
-                    else 0,
-                )
-                st.session_state.gemini_api_key = st.text_input(
-                    "Google API key",
-                    value=os.getenv("GOOGLE_API_KEY", ""),
-                    type="password",
-                    help="For demos only. Production apps should keep this in .env or server secrets.",
-                )
-            else:
-                model_name = st.selectbox(
-                    "OpenAI model",
-                    ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
-                    index=0,
-                )
-                st.session_state.openai_api_key = st.text_input(
-                    "OpenAI API key",
-                    value=os.getenv("OPENAI_API_KEY", ""),
-                    type="password",
-                    help="For demos only. Production apps should keep this in .env or server secrets.",
-                )
+                if provider == "Gemini":
+                    gemini_models = [
+                        "gemini-2.5-flash-lite",
+                        "gemini-2.5-flash",
+                        "gemini-2.5-pro",
+                    ]
+                    model_name = st.selectbox(
+                        "Gemini model",
+                        gemini_models,
+                        index=gemini_models.index(model_name) if model_name in gemini_models else 0,
+                    )
+                    st.session_state.gemini_api_key = st.text_input(
+                        "Google API key",
+                        value=secret_or_env("GOOGLE_API_KEY"),
+                        type="password",
+                    )
+                else:
+                    model_name = st.selectbox(
+                        "OpenAI model",
+                        ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+                        index=0,
+                    )
+                    st.session_state.openai_api_key = st.text_input(
+                        "OpenAI API key",
+                        value=secret_or_env("OPENAI_API_KEY"),
+                        type="password",
+                    )
+        else:
+            st.caption(f"Model: {provider} / {model_name}")
 
         st.divider()
-        temperature = st.slider("Creativity", 0.0, 1.0, float(os.getenv("TEMPERATURE", "0.25")), 0.05)
+        temperature = st.slider(
+            "Creativity",
+            0.0,
+            1.0,
+            float(secret_or_env("TEMPERATURE", "0.25")),
+            0.05,
+        )
         st.caption(
             "Optimized for accelerated inference on AMD GPUs and AMD Developer Cloud "
             "with ROCm-ready scalable AI workflows."
         )
 
     return provider, model_name, float(temperature)
+
+
+def render_hackathon_setup_notice(provider: str) -> None:
+    key_name = "GOOGLE_API_KEY" if provider == "Gemini" else "OPENAI_API_KEY"
+    st.warning(
+        f"AI model access is not configured. Add `{key_name}` in `.env` locally "
+        "or in Streamlit secrets for deployment. The Reasoning Agent demo still works offline."
+    )
+    with st.expander("Hackathon deployment setup"):
+        st.markdown(
+            f"""
+            1. Create `.env` from `.env.example` for local demos.
+            2. Add `{key_name}` without committing the real key.
+            3. For Streamlit Cloud, add the key in **App settings -> Secrets**.
+            4. Set `SHOW_LOCAL_CONFIG=true` only if you want local API/model controls visible.
+            """
+        )
 
 
 def process_upload(provider: str, api_key: str) -> None:
@@ -121,7 +166,7 @@ def process_upload(provider: str, api_key: str) -> None:
         return
 
     if not api_key:
-        st.warning("Add an API key in the sidebar before processing PDFs.")
+        st.warning("AI model access must be configured before processing PDFs.")
         return
 
     if st.button("Analyze PDFs", type="primary", use_container_width=True):
@@ -181,17 +226,20 @@ def render_dashboard() -> None:
         unsafe_allow_html=True,
     )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3 = st.columns(3)
     with col1:
         agent_card("Notes Analysis", "Extracts concepts, exam themes, and chapter signals.")
     with col2:
         agent_card("Doubt Solver", "Answers questions using your uploaded notes.")
     with col3:
         agent_card("Quiz Generator", "Creates MCQs with answers and explanations.")
+    col4, col5, col6 = st.columns(3)
     with col4:
         agent_card("Viva Agent", "Builds oral exam questions and model answers.")
     with col5:
         agent_card("Planner Agent", "Turns topics and exam date into a timetable.")
+    with col6:
+        agent_card("Reasoning Agent", "Shows Plan -> Act -> Observe SQL correction.")
 
 
 def require_notes() -> bool:
@@ -429,6 +477,61 @@ def run_planner_agent(agent: PlannerAgent) -> None:
             render_trace(st.session_state.last_plan.trace)
 
 
+def run_reasoning_agent_demo() -> None:
+    st.subheader("Autonomous Reasoning Agent")
+    st.caption("Local SQLite demo: one failed SQL action, one corrected retry, and a final result.")
+
+    if st.button("Run Reasoning Demo", type="primary"):
+        with st.spinner("Running Plan -> Act -> Observe loop..."):
+            try:
+                st.session_state.last_reasoning_demo = asyncio.run(run_demo_detailed())
+            except Exception as exc:
+                st.error("Reasoning demo failed.")
+                st.exception(exc)
+                return
+
+    result: AgentRunResult | None = st.session_state.last_reasoning_demo
+    if not result:
+        return
+
+    state = result.state
+    st.success(result.final_answer)
+
+    st.markdown("### Reasoning Trace")
+    for item in state.transcript:
+        iteration = item.get("iteration")
+        st.markdown(f"#### Iteration {iteration}")
+        st.markdown(f"**Agent thought:** {item.get('thought') or 'No thought recorded.'}")
+
+        steps = item.get("steps", [])
+        if steps:
+            for step in steps:
+                action_input = step.get("action_input", {})
+                query = action_input.get("query")
+                st.markdown(f"**Selected tool:** `{step.get('action')}`")
+                st.markdown(f"**Tool thought:** {step.get('thought')}")
+                if query:
+                    st.code(query, language="sql")
+                with st.expander("Raw tool input"):
+                    st.json(action_input)
+        elif item.get("final_answer"):
+            st.markdown("**Final result:**")
+            st.code(item["final_answer"], language="text")
+
+    st.markdown("### Observations")
+    for index, observation in enumerate(state.observations, start=1):
+        status = "Success" if observation.get("ok") else "Database Error"
+        st.markdown(f"#### Observation {index}: {status}")
+        if observation.get("error"):
+            st.error(observation["error"])
+        if observation.get("raw_error"):
+            with st.expander("Exact database error log"):
+                st.code(observation["raw_error"], language="json")
+        if observation.get("output"):
+            st.markdown("**Raw data output:**")
+            st.json(observation["output"])
+
+
 def render_status() -> None:
     if st.session_state.vectorstore:
         st.markdown(
@@ -459,8 +562,13 @@ def main() -> None:
     render_status()
     process_upload(provider, api_key)
 
+    active_agent = st.session_state.get("active_agent", "Doubt Solver")
+    if active_agent == "Reasoning Agent":
+        run_reasoning_agent_demo()
+        return
+
     if not api_key:
-        st.warning("Add your API key in `.env` or in Developer settings to start the AI agents.")
+        render_hackathon_setup_notice(provider)
         return
 
     try:
@@ -469,7 +577,6 @@ def main() -> None:
         st.error(f"Could not initialize model provider: {exc}")
         return
 
-    active_agent = st.session_state.get("active_agent", "Doubt Solver")
     if active_agent == "Doubt Solver":
         run_doubt_agent(agents["doubt"])
     elif active_agent == "Summaries":
