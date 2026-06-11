@@ -126,3 +126,9 @@ src/ui.py                 # Theme and reusable UI helpers
 This MVP uses `faiss-cpu` for local development. For AMD GPU deployments, connect
 the LangChain model layer to ROCm-compatible inference services running on AMD
 Developer Cloud.
+
+
+git add .
+git commit -m "Save local changes"
+git pull origin main --rebase
+git push origin main

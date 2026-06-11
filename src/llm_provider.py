@@ -23,10 +23,11 @@ def build_chat_model(
         temperature=temperature,
     )
 
+
 def build_embedding_model(provider: str, api_key: str) -> Embeddings:
     if provider == "Gemini":
         return GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
+            model="gemini-embedding-001",
             google_api_key=api_key,
             task_type="RETRIEVAL_DOCUMENT",
         )
